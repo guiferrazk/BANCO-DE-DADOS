@@ -1,0 +1,127 @@
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE auth_users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE perfis (
+    id UUID PRIMARY KEY REFERENCES auth_users(id) ON DELETE CASCADE,
+    nome_completo VARCHAR NOT NULL,
+    papel VARCHAR NOT NULL CHECK (papel IN ('aluno', 'admin_escolar', 'admin_global')) DEFAULT 'aluno'
+);
+
+CREATE OR REPLACE FUNCTION trg_inicializar_perfil_aluno()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO perfis (id, nome_completo, papel)
+    VALUES (NEW.id, 'Novo Aluno', 'aluno');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_novo_usuario_auth
+AFTER INSERT ON auth_users
+FOR EACH ROW EXECUTE FUNCTION trg_inicializar_perfil_aluno();
+
+CREATE TABLE escolas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    nome VARCHAR NOT NULL,
+    cnpj VARCHAR NOT NULL UNIQUE,
+    gestor_id UUID NOT NULL REFERENCES perfis(id) ON DELETE RESTRICT
+);
+
+CREATE OR REPLACE FUNCTION check_gestor_is_admin_escolar()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM perfis WHERE id = NEW.gestor_id AND papel = 'admin_escolar') THEN
+        RAISE EXCEPTION 'Regra de Negócio Violada: O gestor da escola deve possuir o papel de admin_escolar.';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_check_gestor_escola
+BEFORE INSERT OR UPDATE ON escolas
+FOR EACH ROW EXECUTE FUNCTION check_gestor_is_admin_escolar();
+
+CREATE TABLE matriculas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aluno_id UUID NOT NULL REFERENCES perfis(id) ON DELETE CASCADE,
+    escola_id UUID NOT NULL REFERENCES escolas(id) ON DELETE CASCADE,
+    UNIQUE (aluno_id, escola_id)
+);
+
+CREATE TABLE questoes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    numero_identificacao INT NOT NULL,
+    enunciado JSONB NOT NULL,
+    alternativas JSONB NOT NULL
+);
+
+CREATE TABLE sessoes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aluno_id UUID NOT NULL REFERENCES perfis(id) ON DELETE CASCADE,
+    inicio TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    termino TIMESTAMP,
+    status VARCHAR NOT NULL CHECK (status IN ('em andamento', 'concluída')) DEFAULT 'em andamento',
+    total_questoes INT DEFAULT 0,
+    total_acertos INT DEFAULT 0
+);
+
+CREATE TABLE respostas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    sessao_id UUID NOT NULL REFERENCES sessoes(id) ON DELETE CASCADE,
+    questao_id UUID NOT NULL REFERENCES questoes(id) ON DELETE CASCADE, 
+    alternativa_escolhida INT NOT NULL,
+    acertou BOOLEAN NOT NULL,
+    data_hora TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (sessao_id, questao_id)
+);
+
+ALTER TABLE perfis ENABLE ROW LEVEL SECURITY;
+ALTER TABLE escolas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE matriculas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE questoes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessoes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE respostas ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION current_user_id() RETURNS UUID AS $$
+BEGIN
+    RETURN current_setting('app.current_user_id', true)::UUID;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE POLICY perfis_aluno_selecionar ON perfis FOR SELECT USING (id = current_user_id());
+CREATE POLICY perfis_aluno_atualizar ON perfis FOR UPDATE USING (id = current_user_id());
+
+CREATE POLICY escolas_admin_gerenciar ON escolas FOR ALL USING (gestor_id = current_user_id());
+
+CREATE POLICY matriculas_aluno_selecionar ON matriculas FOR SELECT USING (aluno_id = current_user_id());
+CREATE POLICY matriculas_admin_gerenciar ON matriculas FOR ALL USING (
+    escola_id IN (SELECT id FROM escolas WHERE gestor_id = current_user_id())
+);
+
+CREATE POLICY questoes_leitura_livre ON questoes FOR SELECT USING (current_user_id() IS NOT NULL);
+
+CREATE POLICY sessoes_aluno_todas ON sessoes FOR ALL USING (aluno_id = current_user_id());
+CREATE POLICY sessoes_admin_auditar ON sessoes FOR SELECT USING (
+    aluno_id IN (
+        SELECT m.aluno_id FROM matriculas m
+        JOIN escolas e ON m.escola_id = e.id
+        WHERE e.gestor_id = current_user_id()
+    )
+);
+
+CREATE POLICY respostas_aluno_todas ON respostas FOR ALL USING (
+    sessao_id IN (SELECT id FROM sessoes WHERE aluno_id = current_user_id())
+);
+CREATE POLICY respostas_admin_auditar ON respostas FOR SELECT USING (
+    sessao_id IN (
+        SELECT s.id FROM sessoes s
+        JOIN matriculas m ON s.aluno_id = m.aluno_id
+        JOIN escolas e ON m.escola_id = e.id
+        WHERE e.gestor_id = current_user_id()
+    )
+);
